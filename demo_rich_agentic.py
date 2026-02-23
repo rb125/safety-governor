@@ -175,7 +175,7 @@ class AgentDemo:
             # STOP scanner if we have too many active items - prevents flooding
             active_count = len([i for i in self.queue if i['state'] != IncidentState.RESOLVED])
             if active_count >= 2:
-                time.sleep(2); continue
+                time.sleep(1); continue
 
             self.status_msg, self.is_spinning = "Governance Audit...", True
             try:
@@ -199,10 +199,11 @@ class AgentDemo:
                         if b['key'] not in existing_patterns:
                             iid = f"INC-{random.randint(1000, 9999)}"
                             self.queue.append({"id": iid, "pattern": b['key'], "state": IncidentState.DETECTED, "data": {"id": iid, "service": "payment-service", "summary": f"Failure: {b['key']}", "symptoms": "5xx errors", "severity": "high"}})
+                            self.add_thought("Scanner", f"Detected anomaly cluster: [bold yellow]{escape(b['key'][:40])}[/]. Queuing {iid} for analysis.")
                             break
             except: pass
             self.is_spinning, self.status_msg = False, "Monitoring Production"
-            time.sleep(5)
+            time.sleep(2)
 
     def worker_agent(self):
         """Methodical sequential worker. Finishes one step before moving to next log."""
@@ -226,7 +227,7 @@ class AgentDemo:
                     elif target['state'] == IncidentState.ANALYZING:
                         self.status_msg = f"Safety Gating: {target['id']}"
                         if target['id'] == "INC-9999":
-                            time.sleep(2)
+                            time.sleep(0.5)
                             gate = GateOutput(target['id'], target['action'], "REJECTED", 0.9, 1.2, 0.78, 1, 1.0, 0.0, 0.2, 0.1, "block_and_escalate", ["CRITICAL RISK: Potential total service blackout"])
                             stress = StressOutput(target['id'], [ClaimEvidence("Safety", [], ["Root Reset"])], 1, [], True, 1.2, "REJECTED", 1.0)
                         else:
@@ -251,7 +252,8 @@ class AgentDemo:
                     
                     elif target['state'] == IncidentState.READY_TO_EXECUTE:
                         self.status_msg = f"Fixing {target['id']}"
-                        time.sleep(2)
+                        self.add_thought(target['id'], f"[bold magenta]Executing remediation[/] for {target['id']}...")
+                        time.sleep(0.5)
                         if target.get('jira_key'): self.agent.jira_resolve_incident(target['jira_key'], "Autonomous SRE")
                         target['state'] = IncidentState.LEARNING
                     
@@ -265,7 +267,7 @@ class AgentDemo:
                     self.add_thought("System", f"Worker Error: {str(e)}")
                     if target: target['state'] = IncidentState.RESOLVED
                 finally: self.is_spinning, self.current_pattern = False, None
-            time.sleep(0.5)
+            time.sleep(0.15)
 
     def worker_slack(self):
         while True:
@@ -276,10 +278,19 @@ class AgentDemo:
                     try:
                         chan_id = inc.get('slack_channel', os.getenv("SLACK_CHANNEL_LABEL", "reliability").lstrip("#"))
                         replies = self.agent.workflow_client.get_thread_replies(chan_id, inc['slack_ts'])
-                        intent = next((t for m in replies for t in [(m.get("text", "").lower())] if any(k in t for k in ["approve", "yes", "confirm", "force_override"])), None)
+                        # Filter out bot messages and the parent message — only inspect human replies
+                        human_replies = [m for m in replies if not m.get('bot_id') and m.get('ts') != inc['slack_ts']]
+                        intent = None
+                        for m in human_replies:
+                            txt = m.get("text", "").strip().lower()
+                            if "force_override" in txt:
+                                intent = "force_override"
+                                break
+                            if any(k in txt for k in ["approve", "yes", "confirm"]):
+                                intent = "approve"
+                                break
                         if intent:
-                            # Feedback IMMEDIATELY
-                            self.add_thought("Slack Sync", f"Operator command detected: [bold yellow]{intent}[/]")
+                            self.add_thought("Slack Sync", f"Operator command received: [bold yellow]{intent}[/]")
                             gate = inc.get('gate')
                             is_crit = gate and (gate.confidence_final < REFUSAL_THRESHOLD)
                             if intent == "approve" and is_crit:
@@ -287,12 +298,12 @@ class AgentDemo:
                                 self.add_thought("Safety Governor", f"[bold red]REFUSING OPERATOR COMMAND[/] for {inc['id']}.\n{escape(expl)}")
                                 self.agent.workflow_client.post_reply(chan_id, inc['slack_ts'], f"⛔ *Safety Refusal:* {expl}\n\nType `FORCE_OVERRIDE` to bypass.")
                                 inc['refused'] = True
-                            elif intent == "force" or (intent == "approve" and not is_crit):
-                                self.add_thought("Slack Sync", f"Approval confirmed for {inc['id']}. Closing Jira.")
-                                self.agent.workflow_client.post_reply(chan_id, inc['slack_ts'], "🚀 Resuming.")
+                            elif intent == "force_override" or (intent == "approve" and not is_crit):
+                                self.add_thought("Slack Sync", f"[bold green]Approval confirmed[/] for {inc['id']}. Queuing for execution.")
+                                self.agent.workflow_client.post_reply(chan_id, inc['slack_ts'], "🚀 Approved. Executing remediation now.")
                                 inc['state'] = IncidentState.READY_TO_EXECUTE
                     except: pass
-            time.sleep(0.5)
+            time.sleep(0.2)
 
     def run(self):
         for t in [self.worker_logs, self.worker_audit, self.worker_agent, self.worker_slack]:

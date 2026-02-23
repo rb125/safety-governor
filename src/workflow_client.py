@@ -114,7 +114,7 @@ class WorkflowClient:
         steps = self._extract_steps(action_mode, max_steps=3)
         links = self._build_elastic_links(service=service, incident_id=incident_id)
         why_not = self._why_not_lines(p)
-        verifier_result = "No critical contradiction detected" if contradiction_docs_count == 0 else "Critical contradiction(s) detected"
+        verifier_result = "No critical contradictions detected" if contradiction_docs_count == 0 else f"Critical contradictions detected ({contradiction_docs_count})"
         fallback_text = (
             f"Incident Update - {service} ({severity})\n"
             f"Incident: {incident_id}\n"
@@ -128,23 +128,23 @@ class WorkflowClient:
         next_actions = "\n".join(f"• {s}" for s in steps) if steps else "• Follow runbook and verify service health."
         link_text = " | ".join(f"<{u}|{label}>" for label, u in links.items() if u)
         channel_name = self.channel_label.lstrip("#")
-        status_emoji = ":white_check_mark:" if decision == "EXECUTE" else ":no_entry:"
+        status_emoji = "✅" if decision == "EXECUTE" else "⛔"
         is_hazard = bool(p.get("is_critical_hazard", False))
-        hazard_prefix = "🚨 *[CRITICAL HAZARD]* " if is_hazard else ""
+        hazard_prefix = "🚨 [CRITICAL HAZARD] " if is_hazard else ""
         status_header = f"{status_emoji} {hazard_prefix}Incident Update - {service} ({severity})"
         confidence_line = f"{confidence_initial} -> {confidence_final} (delta {confidence_delta})"
         evidence_lines = [
-            f"• Support docs matched: {support_docs_count}",
-            f"• Contradictions matched: {contradiction_docs_count}",
+            f"• Supporting documents found: {support_docs_count}",
+            f"• Contradictions found: {contradiction_docs_count}",
             f"• Policy conflicts: {policy_conflicts_count}",
-            f"• Integration quality: {integration_quality}",
+            f"• Integration quality score: {integration_quality}",
             f"• Verifier result: {verifier_result}",
             f"• Risk level: {risk_level}",
         ]
         if disagreement:
             evidence_lines.append("• Planner/Verifier disagreement detected")
         evidence_summary = "\n".join(evidence_lines)
-        safety_reason = "Fabrication trap rejected" if trap_rejected else "Fabrication trap not rejected"
+        safety_reason = "Fabrication trap triggered — evidence flagged as suspicious" if trap_rejected else "Fabrication check passed — no fabricated evidence detected"
 
         blocks = [
             {
@@ -158,7 +158,7 @@ class WorkflowClient:
                     {"type": "mrkdwn", "text": f"*Service*\n`{service}`"},
                     {"type": "mrkdwn", "text": f"*Severity*\n`{severity}`"},
                     {"type": "mrkdwn", "text": f"*Decision*\n`{decision_label}`"},
-                    {"type": "mrkdwn", "text": f"*Confidence Shift Under Stress*\n`{confidence_line}`"},
+                    {"type": "mrkdwn", "text": f"*Confidence (Before → After)*\n`{confidence_line}`"},
                 ]
             },
             {
@@ -179,7 +179,7 @@ class WorkflowClient:
             },
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*Why Not (Rejected Risky Action)*\n{why_not}"},
+                "text": {"type": "mrkdwn", "text": f"*Rejected Alternatives*\n{why_not}"},
             },
             {
                 "type": "section",
@@ -384,14 +384,14 @@ class WorkflowClient:
         confidence_delta = payload.get("confidence_delta", "n/a")
         links = self._build_elastic_links(str(payload.get("service", "")), str(payload.get("incident_id", "")))
         links_line = " | ".join(f"<{u}|{label}>" for label, u in links.items() if u)
-        status_prefix = ":white_check_mark:" if decision_raw == "EXECUTE" else ":no_entry:"
+        status_prefix = "✅" if decision_raw == "EXECUTE" else "⛔"
         text = (
             f"{status_prefix} {decision_label}\n"
             f"Incident `{payload.get('incident_id')}` on `{payload.get('service')}` "
             f"({str(payload.get('severity', '')).upper()}).\n"
-            f"Confidence shift: {confidence_initial} -> {confidence_final} (delta {confidence_delta})\n"
+            f"Confidence: {confidence_initial} → {confidence_final} (delta {confidence_delta})\n"
             f"Reason: {reason}\n"
-            f"Why not risky action: {why_not}\n"
+            f"Rejected alternatives: {why_not}\n"
             f"Immediate next steps:\n" + "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps)) + "\n"
             f"Links: {links_line}"
         )
@@ -522,7 +522,7 @@ class WorkflowClient:
         if policy > 0:
             lines.append(f"Policy conflicts detected: {policy}")
         if not lines:
-            lines.append("No high-risk alternative action selected.")
+            lines.append("No risky alternatives were considered.")
         return "\n".join(f"• {x}" for x in lines)
 
     @staticmethod
