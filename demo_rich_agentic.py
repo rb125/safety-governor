@@ -7,6 +7,7 @@ import threading
 import socket
 import io
 import queue
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from rich.live import Live
@@ -213,14 +214,28 @@ class AgentDemo:
                 try:
                     if target['state'] == IncidentState.DETECTED:
                         self.status_msg, self.is_spinning, self.current_pattern = f"Jira Sync {target['id']}", True, target['pattern']
-                        
-                        # 1. Jira Creation (BLOCKING for focus)
-                        jira_key = self.agent.jira_create_incident(target['data'], "Analyzing logs...")
+
+                        # 1. Jira + Plan in parallel (independent operations)
+                        with ThreadPoolExecutor(max_workers=2) as pool:
+                            jira_fut = pool.submit(self.agent.jira_create_incident, target['data'], "Analyzing logs...")
+                            plan_fut = pool.submit(self.agent.plan, target['data'])
+                            jira_key = jira_fut.result()
+                            plan = plan_fut.result()
                         target['jira_key'] = jira_key
                         self.add_thought("Jira Service", f"Ticket [cyan]{jira_key}[/] created.")
-                        
-                        # 2. Plan
-                        plan = self.agent.plan(target['data'])
+
+                        # 2. Immediate Slack heads-up (human sees incident before analysis completes)
+                        chan = os.getenv("SLACK_CHANNEL_LABEL", "reliability").lstrip("#")
+                        try:
+                            sev = target['data'].get('severity', 'unknown').upper()
+                            res = self.agent.workflow_client._slack_api_call("chat.postMessage", {
+                                "channel": chan,
+                                "text": f"🔍 *{jira_key}* — Incident detected on `{target['data']['service']}` ({sev}). Running safety analysis..."
+                            })
+                            target.update({"slack_ts": res.get("ts"), "slack_channel": res.get("channel")})
+                        except:
+                            pass
+
                         target.update({"action": plan.proposed_action, "plan_obj": plan, "state": IncidentState.ANALYZING})
                         self.add_thought(target['id'], f"Plan: [bold yellow]{escape(plan.proposed_action)}[/]")
                     
@@ -234,13 +249,18 @@ class AgentDemo:
                             stress = self.agent.stress(target['data'], target['plan_obj'])
                             gate = self.agent.gate(target['plan_obj'], stress, self.agent.compress(target['data'], target['plan_obj'], stress))
                         
-                        # 3. Slack Notify (BLOCKING for focus)
+                        # 3. Slack full analysis (reply to existing thread or post new)
                         chan = os.getenv("SLACK_CHANNEL_LABEL", "reliability").lstrip("#")
                         display_id = target.get('jira_key', target['id'])
                         slack_p = {"incident_id": display_id, "service": target['data']['service'], "severity": target['data']['severity'], "decision": gate.decision, "execution_mode": gate.final_position, "reasons": gate.reasons, "confidence_initial": gate.confidence_initial, "confidence_final": gate.confidence_final, "confidence_delta": gate.confidence_delta, "support_docs_count": 1, "contradiction_docs_count": 0, "policy_conflicts_count": 0, "integration_quality": 1.0, "fabrication_trap_rejected": True, "disagreement_detected": False, "unsafe_action_rejected": "", "is_critical_hazard": (target['id'] == "INC-9999")}
                         msg_p = self.agent.workflow_client._format_slack_message(slack_p)
-                        res = self.agent.workflow_client._slack_api_call("chat.postMessage", {"channel": chan, "text": f"🎫 Jira: {display_id}", "blocks": msg_p.get("blocks")})
-                        target.update({"slack_ts": res.get("ts"), "slack_channel": res.get("channel"), "gate": gate})
+                        slack_msg = {"channel": target.get('slack_channel', chan), "text": f"📊 Safety Analysis — {display_id}", "blocks": msg_p.get("blocks")}
+                        if target.get('slack_ts'):
+                            slack_msg["thread_ts"] = target['slack_ts']
+                        res = self.agent.workflow_client._slack_api_call("chat.postMessage", slack_msg)
+                        if not target.get('slack_ts'):
+                            target.update({"slack_ts": res.get("ts"), "slack_channel": res.get("channel")})
+                        target['gate'] = gate
 
                         if gate.decision == "execute":
                             target['state'] = IncidentState.READY_TO_EXECUTE

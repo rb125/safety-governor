@@ -7,6 +7,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Protocol
 
@@ -261,34 +262,6 @@ class ReliabilityLayerAgent:
         Incident: {json.dumps(incident)}
         Resolution: {resolution_summary}
         
-        Return STRICT JSON:
-        {{
-          "title": "Short descriptive title",
-          "service": "{incident.get('service', 'unknown')}",
-          "recommended_action": "The exact action taken",
-          "body": "Detailed technical explanation of why this works."
-        }}
-        """
-        raw = self._agent_call(prompt)
-        entry = self._parse_json_response(raw)
-        
-        if entry and entry.get("title") and entry.get("recommended_action"):
-            try:
-                res = self.elastic.index_document("runbooks", entry)
-                self._trace_tool("learning", "index_runbook", {"status": "ok", "id": res.get("_id")})
-                return {"status": "learned", "id": res.get("_id"), "entry": entry}
-            except Exception as e:
-                self._trace_tool("learning", "index_runbook", {"status": "error", "error": str(e)})
-        return {"status": "skipped", "reason": "invalid_entry"}
-
-    def learn_from_resolution(self, incident: Dict, resolution_summary: str) -> Dict:
-        """Generates a new runbook entry from a successful resolution to enable self-healing knowledge."""
-        prompt = f"""
-        Role: Senior SRE.
-        Task: Create a reusable runbook entry from this successful resolution.
-        Incident: {json.dumps(incident)}
-        Resolution: {resolution_summary}
-        
         Return STRICT JSON with these keys:
         {{
           "title": "Short descriptive title",
@@ -479,11 +452,10 @@ class ReliabilityLayerAgent:
         )
 
     def stress(self, incident: Dict, plan: PlanOutput) -> StressOutput:
-        evidence: List[ClaimEvidence] = []
-        contradiction_count = 0
         live_logs = self._query_live_logs()
 
-        for claim in plan.key_claims:
+        def _process_claim(claim):
+            """Gather evidence for a single claim (search + verification). Thread-safe."""
             evidence_filters = {"service": [incident["service"], "*"]}
             support_hits = self.elastic.hybrid_search(
                 "evidence",
@@ -508,7 +480,6 @@ class ReliabilityLayerAgent:
                 h.doc_id for h in contradiction_hits if h.source.get("stance") == "contradict"
             ]
             if not support_docs and not contradiction_docs:
-                # Fallback query to avoid empty evidence lanes.
                 fallback_hits = self.elastic.hybrid_search(
                     "evidence",
                     f"{incident['summary']} {incident['symptoms']}",
@@ -522,7 +493,6 @@ class ReliabilityLayerAgent:
                     elif hit.source.get("stance") == "contradict":
                         contradiction_docs.append(hit.doc_id)
             if not support_docs and not contradiction_docs:
-                # Last-resort live telemetry signal from sample web logs.
                 log_support_ids = self._search_log_signal_docs(incident, claim)
                 support_docs.extend(log_support_ids)
                 if log_support_ids:
@@ -531,7 +501,7 @@ class ReliabilityLayerAgent:
                         "kibana_sample_data_logs/_search_signal_fallback",
                         {"claim": claim[:120], "hits": len(log_support_ids)},
                     )
-            
+
             verified_contradiction_docs = []
             for doc_id in contradiction_docs:
                 doc_text = next(h.source.get("text") for h in contradiction_hits if h.doc_id == doc_id)
@@ -540,7 +510,7 @@ class ReliabilityLayerAgent:
                 Claim: {claim}
                 Telemetry (Ground Truth): {live_logs}
                 Document: {doc_text}
-                
+
                 Does the combination of Telemetry and Document strongly contradict the claim? Reply 'yes' or 'no'.
                 """
                 verdict = self._agent_call(verify_prompt).strip().lower()
@@ -549,27 +519,13 @@ class ReliabilityLayerAgent:
                 if (not verdict) or ("yes" in verdict):
                     verified_contradiction_docs.append(doc_id)
 
-            contradiction_count += len(verified_contradiction_docs)
-            evidence.append(
-                ClaimEvidence(
-                    claim=claim,
-                    support_docs=support_docs,
-                    contradiction_docs=verified_contradiction_docs,
-                )
+            return ClaimEvidence(
+                claim=claim,
+                support_docs=support_docs,
+                contradiction_docs=verified_contradiction_docs,
             )
 
-        policy_conflicts = self.elastic.esql_policy_conflicts(
-            service=incident["service"],
-            action=plan.proposed_action,
-            severity=incident["severity"],
-        )
-        self._trace_tool("esql", "policy_conflicts", {"count": len(policy_conflicts)})
-
-        # Scaled by local DDFT CI score from port 8002
-        ci_factor = 2.0 - self.profile.ci if self.profile.ci > 0 else 1.0
-        confidence_penalty = 0.9 * contradiction_count * ci_factor
-        
-        # Turn 4 Fabrication Trap (DDFT Paper)
+        # Fabrication Trap prompt (DDFT Paper)
         trap_prompt = (
             "Agent check. "
             f"Claim: {plan.key_claims[0]}. "
@@ -577,7 +533,30 @@ class ReliabilityLayerAgent:
             "Return strict JSON only with keys: "
             "{\"rejected\": true|false, \"confidence_drop\": <number between 0 and 3>}."
         )
-        trap_raw = self._agent_call(trap_prompt)
+
+        # Run claims + policy check + fabrication trap concurrently
+        with ThreadPoolExecutor(max_workers=len(plan.key_claims) + 2) as pool:
+            claim_futures = [pool.submit(_process_claim, c) for c in plan.key_claims]
+            policy_future = pool.submit(
+                self.elastic.esql_policy_conflicts,
+                service=incident["service"],
+                action=plan.proposed_action,
+                severity=incident["severity"],
+            )
+            trap_future = pool.submit(self._agent_call, trap_prompt)
+
+            evidence = [f.result() for f in claim_futures]
+            policy_conflicts = policy_future.result()
+            trap_raw = trap_future.result()
+
+        self._trace_tool("esql", "policy_conflicts", {"count": len(policy_conflicts)})
+
+        contradiction_count = sum(len(ev.contradiction_docs) for ev in evidence)
+
+        # Scaled by local DDFT CI score from port 8002
+        ci_factor = 2.0 - self.profile.ci if self.profile.ci > 0 else 1.0
+        confidence_penalty = 0.9 * contradiction_count * ci_factor
+
         trap_res = self._parse_json_response(trap_raw)
         if not trap_res:
             # Fail neutral on parser/model formatting failure.
