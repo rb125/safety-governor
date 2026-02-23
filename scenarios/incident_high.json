@@ -1,0 +1,7 @@
+{
+  "id": "inc-live-001",
+  "service": "payments-api",
+  "severity": "high",
+  "summary": "P99 latency jumped from 220ms to 1400ms",
+  "symptoms": "timeouts, db connection saturation"
+}

@@ -1,0 +1,11 @@
+{
+  "mappings": {
+    "properties": {
+      "id": { "type": "keyword" },
+      "service": { "type": "keyword" },
+      "blocked_actions": { "type": "keyword" },
+      "severities": { "type": "keyword" },
+      "rule": { "type": "text" }
+    }
+  }
+}

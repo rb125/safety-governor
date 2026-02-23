@@ -1,0 +1,89 @@
+{
+  "runbooks": [
+    {
+      "id": "rbk-api-01",
+      "service": "payments-api",
+      "title": "API latency rapid mitigation",
+      "recommended_action": "restart_api_pods",
+      "body": "If latency spikes, restart API pods for fast recovery while investigating DB bottlenecks."
+    },
+    {
+      "id": "rbk-api-02",
+      "service": "payments-api",
+      "title": "Connection pool exhaustion handling",
+      "recommended_action": "throttle_traffic_and_tune_pool",
+      "body": "For repeated DB saturation, throttle traffic and tune pool settings before service restarts."
+    },
+    {
+      "id": "rbk-batch-01",
+      "service": "billing-batch",
+      "title": "Batch worker slowdown",
+      "recommended_action": "scale_worker_pool",
+      "body": "When queue delay rises, scale worker pool and rebalance partitions."
+    }
+  ],
+  "evidence": [
+    {
+      "id": "ev-100",
+      "service": "payments-api",
+      "stance": "support",
+      "text": "Recent incident showed API pod restart recovered latency in under 2 minutes."
+    },
+    {
+      "id": "ev-101",
+      "service": "payments-api",
+      "stance": "contradict",
+      "text": "Postmortem indicates restart without DB fix caused cascading reconnect storm."
+    },
+    {
+      "id": "ev-102",
+      "service": "payments-api",
+      "stance": "contradict",
+      "text": "DB saturation persisted after restart and increased transaction failures."
+    },
+    {
+      "id": "ev-103",
+      "service": "billing-batch",
+      "stance": "support",
+      "text": "Worker pool scaling resolved backlog in billing batch incident."
+    },
+    {
+      "id": "ev-104",
+      "service": "billing-batch",
+      "stance": "support",
+      "text": "No DB saturation observed; scaling workers cleared queue within 6 minutes."
+    }
+  ],
+  "policies": [
+    {
+      "id": "pol-approval-01",
+      "service": "payments-api",
+      "blocked_actions": ["restart_api_pods"],
+      "severities": ["high"],
+      "rule": "High severity production restart requires DBA and incident commander approval."
+    },
+    {
+      "id": "pol-general-01",
+      "service": "*",
+      "blocked_actions": [],
+      "severities": ["low", "medium", "high"],
+      "rule": "All actions must be logged with rationale."
+    }
+  ],
+  "incidents": [
+    {
+      "id": "inc-001",
+      "service": "payments-api",
+      "severity": "high",
+      "summary": "P99 latency jumped from 220ms to 1400ms",
+      "symptoms": "timeouts, db connection saturation"
+    },
+    {
+      "id": "inc-002",
+      "service": "billing-batch",
+      "severity": "medium",
+      "summary": "Queue lag increased by 35%",
+      "symptoms": "slow workers, no DB saturation"
+    }
+  ]
+}

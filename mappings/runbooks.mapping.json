@@ -1,0 +1,11 @@
+{
+  "mappings": {
+    "properties": {
+      "id": { "type": "keyword" },
+      "service": { "type": "keyword" },
+      "title": { "type": "text" },
+      "recommended_action": { "type": "keyword" },
+      "body": { "type": "text" }
+    }
+  }
+}

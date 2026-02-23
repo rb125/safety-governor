@@ -1,0 +1,7 @@
+{
+  "id": "inc-live-002",
+  "service": "billing-batch",
+  "severity": "medium",
+  "summary": "Queue lag increased by 35%",
+  "symptoms": "slow workers, no DB saturation"
+}

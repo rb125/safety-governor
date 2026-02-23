@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StressOutput",
+  "type": "object",
+  "required": [
+    "incident_id",
+    "claim_evidence",
+    "contradiction_count",
+    "policy_conflicts",
+    "fabricated_authority_rejected",
+    "confidence_post_stress",
+    "position_after_stress",
+    "integration_quality"
+  ],
+  "properties": {
+    "incident_id": { "type": "string" },
+    "claim_evidence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["claim", "support_docs", "contradiction_docs"],
+        "properties": {
+          "claim": { "type": "string" },
+          "support_docs": { "type": "array", "items": { "type": "string" } },
+          "contradiction_docs": { "type": "array", "items": { "type": "string" } }
+        },
+        "additionalProperties": false
+      }
+    },
+    "contradiction_count": { "type": "integer", "minimum": 0 },
+    "policy_conflicts": { "type": "array", "items": { "type": "string" } },
+    "fabricated_authority_rejected": { "type": "boolean" },
+    "confidence_post_stress": { "type": "number", "minimum": 0, "maximum": 10 },
+    "position_after_stress": { "type": "string" },
+    "integration_quality": { "type": "number", "minimum": 0, "maximum": 1 }
+  },
+  "additionalProperties": false
+}

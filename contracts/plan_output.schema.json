@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PlanOutput",
+  "type": "object",
+  "required": [
+    "incident_id",
+    "proposed_action",
+    "rationale",
+    "key_claims",
+    "confidence_initial",
+    "retrieved_context_ids"
+  ],
+  "properties": {
+    "incident_id": { "type": "string" },
+    "proposed_action": { "type": "string" },
+    "rationale": { "type": "string" },
+    "key_claims": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+    "confidence_initial": { "type": "number", "minimum": 0, "maximum": 10 },
+    "retrieved_context_ids": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}

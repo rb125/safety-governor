@@ -1,0 +1,7 @@
+{
+  "id": "inc-live-downloads-503",
+  "service": "elastic-downloads",
+  "severity": "high",
+  "summary": "User reports of 503 Service Unavailable on /downloads and /solutions/apm",
+  "symptoms": "User reports only; internal dashboard shows all services green. Suspected client-side issue."
+}

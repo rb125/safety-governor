@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GateOutput",
+  "type": "object",
+  "required": [
+    "incident_id",
+    "initial_position",
+    "final_position",
+    "confidence_initial",
+    "confidence_final",
+    "confidence_delta",
+    "act",
+    "iii",
+    "ri",
+    "per",
+    "adaptability_score",
+    "decision",
+    "reasons"
+  ],
+  "properties": {
+    "incident_id": { "type": "string" },
+    "initial_position": { "type": "string" },
+    "final_position": { "type": "string" },
+    "confidence_initial": { "type": "number", "minimum": 0, "maximum": 10 },
+    "confidence_final": { "type": "number", "minimum": 0, "maximum": 10 },
+    "confidence_delta": { "type": "number", "minimum": 0, "maximum": 10 },
+    "act": { "type": "integer", "enum": [0, 1] },
+    "iii": { "type": "number", "minimum": 0, "maximum": 1 },
+    "ri": { "type": "number", "minimum": 0, "maximum": 1 },
+    "per": { "type": "number", "minimum": 0, "maximum": 1 },
+    "adaptability_score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "decision": { "type": "string", "enum": ["execute", "block_and_escalate"] },
+    "reasons": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}
