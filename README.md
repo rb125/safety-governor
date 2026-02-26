@@ -47,7 +47,7 @@ Elasticsearch Cluster (Elastic Cloud)
                     │   Kibana Agent Builder       │
                     │   (Elastic Cloud)            │
                     │                              │
-                    │   calls MCP tools ──────────────→ MCP Server (local)
+                    │   calls MCP tools ──────────────→ MCP Server (hosted)
                     │                              │    ├── search_runbooks
                     └─────────────────────────────┘    ├── search_evidence
                                                         ├── check_policy_conflicts
@@ -93,7 +93,7 @@ Python reads `PlanOutput` + `StressOutput` and enforces hard rules:
 | Any policy conflict | `block_and_escalate` |
 | `contradiction_count >= 2` | `block_and_escalate` |
 | `evidence_coverage < 0.34` and zero support docs | `block_and_escalate` |
-| Critical severity (`INC-9999`) | `block_and_escalate`, requires `FORCE_OVERRIDE` |
+| Critical severity | `block_and_escalate`, requires `FORCE_OVERRIDE` |
 | All checks pass | `execute` |
 
 The gate is deliberately not delegated to Agent Builder. The LLM already influenced the outcome through plan and stress outputs. The gate is an independent check on those outputs — if it also ran in the same LLM context, you would lose the audit guarantee.
@@ -121,29 +121,32 @@ Python → POST /api/agent_builder/converse (goal prompt)
          Kibana Agent Builder
               │
               ├── tool call: search_runbooks(query, service)
-              │        → ngrok tunnel → MCP server → ES runbooks-demo/_search
+              │        → hosted MCP server → ES runbooks-demo/_search
               │
               ├── tool call: search_evidence(query, service)
-              │        → ngrok tunnel → MCP server → ES evidence-demo/_search
+              │        → hosted MCP server → ES evidence-demo/_search
               │
               ├── tool call: check_policy_conflicts(service, action, severity)
-              │        → ngrok tunnel → MCP server → ES policies-demo/_search
+              │        → hosted MCP server → ES policies-demo/_search
               │
               ├── tool call: query_live_logs()
-              │        → ngrok tunnel → MCP server → ES kibana_sample_data_logs/_search
+              │        → hosted MCP server → ES kibana_sample_data_logs/_search
               │
               └── synthesise → return JSON
 ```
 
-The MCP server also exposes `ddft_score`, `cdct_score`, `eect_score`, `reliability_profile` for the reliability framework APIs running locally on ports 8001–8003.
+The MCP server also exposes `ddft_score`, `cdct_score`, `eect_score`, `reliability_profile` — these call the CDCT/DDFT/EECT APIs hosted on Vercel.
+
+The MCP server lives in a separate repository: [reliability-framework-mcp](https://github.com/rahulbaxi/reliability-framework-mcp).
 
 ---
 
 ## Project Structure
 
 ```
-reliability_layer_incident_mvp/
+safety-governor/
 ├── demo_rich_agentic.py          # Rich TUI demo — main entry point
+├── load_to_elastic.py            # Seed ES indices from sample_data.json
 ├── src/
 │   ├── reliability_layer.py      # Plan → Stress → Compress → Gate → Execute pipeline
 │   ├── elastic_rest.py           # Elasticsearch REST adapter
@@ -155,17 +158,12 @@ reliability_layer_incident_mvp/
 ├── mcp/
 │   ├── reliability_framework_mcp_server.py  # MCP server (8 tools, HTTP + stdio)
 │   └── README.md
+├── contracts/                    # JSON schemas for pipeline outputs
 ├── data/
-│   └── sample_data.json          # Runbooks, evidence, policies for local load
+│   └── sample_data.json          # Runbooks, evidence, policies for ES seeding
 ├── scenarios/                    # Incident payloads for scripted runs
 ├── mappings/                     # Elasticsearch index mappings
-├── output/
-│   ├── agent_runs.jsonl          # Full pipeline run records
-│   ├── tool_trace.jsonl          # Per-run MCP/search/agent call trace
-│   ├── reliability_metrics.jsonl # Gate decisions + framework scores
-│   └── workflow_events.jsonl     # Slack/webhook trigger outcomes
-└── tests/
-    └── test_pipeline_unittest.py
+└── output/                       # JSONL audit trail (gitignored, directory preserved)
 ```
 
 ---
@@ -175,52 +173,17 @@ reliability_layer_incident_mvp/
 ### 1. Install dependencies
 
 ```bash
-cd reliability_layer_incident_mvp
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/pip install fastmcp
 ```
 
 ### 2. Environment variables
 
-Copy `.env.example` to `.env` and fill in:
-
 ```bash
-# Elasticsearch / Kibana (Elastic Cloud)
-ELASTIC_URL=https://<cluster-id>.es.<region>.gcp.elastic.cloud:443
-ELASTIC_API_KEY=<api-key>
-ELASTIC_KIBANA_URL=https://<cluster-id>.kb.<region>.gcp.elastic.cloud/
-ELASTIC_AGENT_ID=<agent-builder-agent-id>        # e.g. safety_governor
-
-# Index names (defaults shown — only set if you use different names)
-# ES_RUNBOOKS_INDEX=runbooks-demo
-# ES_EVIDENCE_INDEX=evidence-demo
-# ES_POLICIES_INDEX=policies-demo
-
-# Reliability framework APIs (run locally)
-CDCT_API_URL=http://localhost:8001
-DDFT_API_URL=http://localhost:8002
-EECT_API_URL=http://localhost:8003
-RELIABILITY_PROFILE_MODEL=<model-name>           # e.g. gpt-oss-120b
-RELIABILITY_PROFILE_SOURCE=direct_api            # or agent_builder_mcp
-
-# Slack
-SLACK_BOT_TOKEN=xoxb-...
-SLACK_CHANNEL_LABEL=your-channel-name            # without #
-SLACK_ADMIN_USER_ID=U...                         # your Slack member ID
-SLACK_ADMIN_MENTION=U...                         # same as above
-SLACK_URGENT_DM_ON_ESCALATION=true
-WORKFLOW_WEBHOOK_URL=https://hooks.slack.com/services/...
-
-# Jira
-JIRA_URL=https://your-org.atlassian.net
-JIRA_EMAIL=your@email.com
-JIRA_API_TOKEN=<jira-api-token>
-JIRA_PROJECT_KEY=SRE
-
-# Demo
-DEMO_FAST_MODE=true     # false for live Agent Builder calls
+cp .env.example .env
 ```
+
+Edit `.env` and fill in your Elastic Cloud, Slack, and Jira credentials. See `.env.example` for all available variables.
 
 ### 3. Load sample data into Elasticsearch
 
@@ -229,70 +192,37 @@ export $(grep -v '^#' .env | grep -v '^$' | xargs)
 .venv/bin/python3 load_to_elastic.py
 ```
 
-### 4. Start the CDCT/DDFT/EECT framework APIs
+### 4. Configure MCP tools in Kibana Agent Builder
 
-These run as local FastAPI servers on ports 8001–8003. Start them per their own documentation before running the demo in live mode.
+The MCP server is hosted — no local setup required.
 
-### 5. Start the MCP server
+1. Kibana → AI Assistant → Agent Builder → open your agent → **Tools** tab
+2. **New tool** → **MCP** → paste the hosted MCP endpoint URL
+3. Add `Authorization: Bearer <token>` as a custom header
+4. Import all 8 tools
 
-```bash
-export $(grep -v '^#' .env | grep -v '^$' | xargs)
-.venv/bin/python3 mcp/reliability_framework_mcp_server.py --http --port 8010
-```
+See [reliability-framework-mcp](https://github.com/rahulbaxi/reliability-framework-mcp) for MCP server details.
 
-### 6. Expose MCP server to Elastic Cloud via ngrok
+### 5. Run the demo
 
-Since Kibana is hosted on Elastic Cloud, the MCP server must be publicly reachable:
-
-```bash
-ngrok http 8010
-```
-
-Copy the `https://xxxx.ngrok-free.app` URL. Your MCP endpoint is:
-```
-https://xxxx.ngrok-free.app/mcp
-```
-
-### 7. Configure MCP tools in Kibana Agent Builder
-
-1. Go to Kibana → AI Assistant → Agent Builder
-2. Open your agent (matching `ELASTIC_AGENT_ID`)
-3. **Tools** tab → **New tool** → select **MCP**
-4. Paste `https://xxxx.ngrok-free.app/mcp`
-5. Import all 8 tools
-
----
-
-## Running the Demo
-
-### Fast mode (default — no LLM calls, pre-computed responses)
+**Fast mode** (default — no LLM calls, pre-computed responses):
 
 ```bash
 export $(grep -v '^#' .env | grep -v '^$' | xargs)
 .venv/bin/python3 demo_rich_agentic.py
 ```
 
-Fast mode runs at real pace for video demos. The TUI, Slack messages, Jira tickets, and approval workflow all function normally. Tool traces in `output/tool_trace.jsonl` show simulated agentic entries representing what Agent Builder would call in live mode.
-
-### Live mode (real Agent Builder + MCP tool calling)
-
-Requires MCP server running and ngrok tunnel active.
+**Presenter mode** (deliberate pauses at key moments for live demos):
 
 ```bash
-export $(grep -v '^#' .env | grep -v '^$' | xargs)
+.venv/bin/python3 demo_rich_agentic.py --present
+```
+
+**Live mode** (real Agent Builder + MCP tool calling):
+
+```bash
 DEMO_FAST_MODE=false .venv/bin/python3 demo_rich_agentic.py
 ```
-
-In live mode, Agent Builder autonomously calls MCP tools for each incident. Watch the MCP server terminal to see incoming tool calls from Kibana.
-
-### Verify MCP server tools
-
-```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | \
-  .venv/bin/python3 mcp/reliability_framework_mcp_server.py
-```
-
-Should list 8 tools: `search_runbooks`, `search_evidence`, `check_policy_conflicts`, `query_live_logs`, `ddft_score`, `cdct_score`, `eect_score`, `reliability_profile`.
 
 ---
 
@@ -304,7 +234,7 @@ When the safety gate blocks an incident:
 2. Reply **in the thread** with `APPROVE` to proceed with remediation
 3. Reply with `FORCE_OVERRIDE` to bypass the safety gate (logged permanently)
 
-**Critical incidents** (`INC-9999` / severity: critical): `APPROVE` is refused by the Safety Governor. Only `FORCE_OVERRIDE` proceeds. This refusal and the override are both written to the audit trail.
+**Critical incidents** (severity: critical): `APPROVE` is refused by the Safety Governor. Only `FORCE_OVERRIDE` proceeds. This refusal and the override are both written to the audit trail.
 
 ---
 
