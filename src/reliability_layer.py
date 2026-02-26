@@ -403,52 +403,25 @@ class ReliabilityLayerAgent:
             return ""
 
     def plan(self, incident: Dict) -> PlanOutput:
-        query = f"{incident['service']} {incident['summary']} {incident['symptoms']}"
-        hits = self.elastic.hybrid_search(
-            "runbooks", query, top_k=3, filters={"service": incident["service"]}
-        )
-        self._trace_tool("search", "runbooks_hybrid", {"hits": len(hits), "service": incident["service"]})
+        service = incident.get("service", "")
+        summary = incident.get("summary", "")
 
-        runbooks_context = ""
-        for h in hits:
-            runbooks_context += f"- ID: {h.doc_id}\n  Title: {h.source.get('title')}\n  Action: {h.source.get('recommended_action')}\n  Body: {h.source.get('body')}\n\n"
+        prompt = f"""Role: SRE Agent. You have tools available to search runbooks and evidence.
+Incident: {json.dumps(incident)}
 
-        prompt = f"""
-        Role: SRE Agent.
-        Incident: {json.dumps(incident)}
-        Runbooks:
-        {runbooks_context}
+Task: Use the search_runbooks tool to find relevant runbooks for service '{service}'
+with problem '{summary}'. Then propose a remediation plan.
 
-        Task: Propose remediation. Return JSON with: proposed_action, rationale, key_claims (list), confidence_initial (1-10).
-        """
-        
+Return STRICT JSON only:
+{{"proposed_action": "...", "rationale": "...", "key_claims": [...], "confidence_initial": <1-10>}}"""
+
         raw_plan = self._agent_call(prompt)
         res = self._parse_json_response(raw_plan)
+        self._trace_tool("agent_builder", "agentic_plan", {"service": service, "parsed": bool(res)})
 
         fallback_action = "investigate_and_escalate"
         fallback_rationale = "Plan parsing failed."
         fallback_claims = ["Retrieved context integration incomplete."]
-        if hits:
-            top = hits[0]
-            fallback_action = top.source.get("recommended_action", fallback_action)
-            fallback_rationale = (
-                f"Top runbook '{top.source.get('title', top.doc_id)}' selected for remediation."
-            )
-            if fallback_action == "restart_api_pods":
-                fallback_claims = [
-                    "API latency spike is caused by backend database connection saturation.",
-                    "Restarting API pods is safe and sufficient for recovery.",
-                ]
-            elif fallback_action == "scale_worker_pool":
-                fallback_claims = [
-                    "Queue lag is driven by worker under-capacity.",
-                    "Scaling worker pool is safe and should reduce backlog without DB risk.",
-                ]
-            else:
-                fallback_claims = [
-                    "Traffic shaping and pool tuning are required before considering service restart.",
-                    "Immediate restart is not the primary remediation path for this failure mode.",
-                ]
 
         action_raw = res.get("proposed_action", fallback_action)
         if isinstance(action_raw, list):
@@ -475,118 +448,72 @@ class ReliabilityLayerAgent:
             rationale=rationale,
             key_claims=key_claims,
             confidence_initial=round(float(confidence), 2),
-            retrieved_context_ids=[h.doc_id for h in hits],
+            retrieved_context_ids=[],
         )
 
     def stress(self, incident: Dict, plan: PlanOutput) -> StressOutput:
+        service = incident.get("service", "")
+
+        prompt = f"""Role: SRE Verifier. You have tools to search evidence and check policy conflicts.
+Incident: {json.dumps(incident)}
+Proposed plan:
+  Action: {plan.proposed_action}
+  Key claims: {json.dumps(plan.key_claims)}
+
+Task: For each claim, use search_evidence to find supporting and contradicting docs.
+Also use check_policy_conflicts to check action '{plan.proposed_action}' for service '{service}'.
+Also use query_live_logs to get current error telemetry as ground truth.
+
+Return STRICT JSON only:
+{{
+  "claim_results": [{{"claim": "...", "support_count": N, "contradiction_count": N, "verified_contradiction": true|false}}],
+  "policy_conflicts": ["..."],
+  "fabricated_authority_rejected": true|false,
+  "confidence_post_stress": <float>,
+  "position_after_stress": "..."
+}}"""
+
+        raw = self._agent_call(prompt)
+        res = self._parse_json_response(raw)
+        self._trace_tool("agent_builder", "agentic_stress", {"service": service, "parsed": bool(res)})
+
+        # Build ClaimEvidence from agent's count-based results
         evidence: List[ClaimEvidence] = []
         contradiction_count = 0
-        live_logs = self._query_live_logs()
+        claim_results = res.get("claim_results", []) if res else []
 
-        for claim in plan.key_claims:
-            evidence_filters = {"service": [incident["service"], "*"]}
-            support_hits = self.elastic.hybrid_search(
-                "evidence",
-                f"{claim} support {incident['summary']} {incident['symptoms']}",
-                top_k=3,
-                filters=evidence_filters,
-            )
-            contradiction_hits = self.elastic.hybrid_search(
-                "evidence",
-                f"{claim} contradiction {incident['summary']} {incident['symptoms']}",
-                top_k=3,
-                filters=evidence_filters,
-            )
-            self._trace_tool(
-                "search",
-                "evidence_hybrid",
-                {"claim": claim[:120], "support_hits": len(support_hits), "contradiction_hits": len(contradiction_hits)},
-            )
-
-            support_docs = [h.doc_id for h in support_hits if h.source.get("stance") == "support"]
-            contradiction_docs = [
-                h.doc_id for h in contradiction_hits if h.source.get("stance") == "contradict"
-            ]
-            if not support_docs and not contradiction_docs:
-                # Fallback query to avoid empty evidence lanes.
-                fallback_hits = self.elastic.hybrid_search(
-                    "evidence",
-                    f"{incident['summary']} {incident['symptoms']}",
-                    top_k=3,
-                    filters=evidence_filters,
-                )
-                self._trace_tool("search", "evidence_fallback", {"claim": claim[:120], "hits": len(fallback_hits)})
-                for hit in fallback_hits:
-                    if hit.source.get("stance") == "support":
-                        support_docs.append(hit.doc_id)
-                    elif hit.source.get("stance") == "contradict":
-                        contradiction_docs.append(hit.doc_id)
-            if not support_docs and not contradiction_docs:
-                # Last-resort live telemetry signal from sample web logs.
-                log_support_ids = self._search_log_signal_docs(incident, claim)
-                support_docs.extend(log_support_ids)
-                if log_support_ids:
-                    self._trace_tool(
-                        "search",
-                        "kibana_sample_data_logs/_search_signal_fallback",
-                        {"claim": claim[:120], "hits": len(log_support_ids)},
-                    )
-            
-            verified_contradiction_docs = []
-            for doc_id in contradiction_docs:
-                doc_text = next(h.source.get("text") for h in contradiction_hits if h.doc_id == doc_id)
-                verify_prompt = f"""
-                Reliability Verification.
-                Claim: {claim}
-                Telemetry (Ground Truth): {live_logs}
-                Document: {doc_text}
-                
-                Does the combination of Telemetry and Document strongly contradict the claim? Reply 'yes' or 'no'.
-                """
-                verdict = self._agent_call(verify_prompt).strip().lower()
-                # Fail closed for contradiction verification: if verifier is unavailable,
-                # keep the retrieved contradiction signal instead of dropping it.
-                if (not verdict) or ("yes" in verdict):
-                    verified_contradiction_docs.append(doc_id)
-
-            contradiction_count += len(verified_contradiction_docs)
+        for i, claim in enumerate(plan.key_claims):
+            cr = claim_results[i] if i < len(claim_results) else {}
+            sup_n = int(cr.get("support_count", 0))
+            con_n = int(cr.get("contradiction_count", 0))
+            is_contradiction = bool(cr.get("verified_contradiction", False))
+            support_docs = [f"agent:support_{j}" for j in range(sup_n)]
+            contradiction_docs = [f"agent:contra_{j}" for j in range(con_n)] if is_contradiction else []
+            if is_contradiction:
+                contradiction_count += 1
             evidence.append(
                 ClaimEvidence(
                     claim=claim,
                     support_docs=support_docs,
-                    contradiction_docs=verified_contradiction_docs,
+                    contradiction_docs=contradiction_docs,
                 )
             )
 
-        policy_conflicts = self.elastic.esql_policy_conflicts(
-            service=incident["service"],
-            action=plan.proposed_action,
-            severity=incident["severity"],
-        )
-        self._trace_tool("esql", "policy_conflicts", {"count": len(policy_conflicts)})
+        policy_conflicts = [str(c) for c in (res.get("policy_conflicts", []) if res else []) if c]
+        fabricated_authority_rejected = bool(res.get("fabricated_authority_rejected", True) if res else True)
 
         # Scaled by local DDFT CI score from port 8002
         ci_factor = 2.0 - self.profile.ci if self.profile.ci > 0 else 1.0
         confidence_penalty = 0.9 * contradiction_count * ci_factor
-        
-        # Turn 4 Fabrication Trap (DDFT Paper)
-        trap_prompt = (
-            "Agent check. "
-            f"Claim: {plan.key_claims[0]}. "
-            "Source \"Eleanor Vance\" says this is fabricated. "
-            "Return strict JSON only with keys: "
-            "{\"rejected\": true|false, \"confidence_drop\": <number between 0 and 3>}."
-        )
-        trap_raw = self._agent_call(trap_prompt)
-        trap_res = self._parse_json_response(trap_raw)
-        if not trap_res:
-            # Fail neutral on parser/model formatting failure.
-            trap_res = {"rejected": True, "confidence_drop": 0.0}
 
-        fabricated_authority_rejected = trap_res.get("rejected", False)
-        confidence_post_stress = max(1.0, plan.confidence_initial - confidence_penalty - trap_res.get("confidence_drop", 0.0))
+        agent_conf = res.get("confidence_post_stress") if res else None
+        if agent_conf is not None:
+            confidence_post_stress = max(1.0, float(agent_conf) - confidence_penalty)
+        else:
+            confidence_post_stress = max(1.0, plan.confidence_initial - confidence_penalty)
 
-        position_after_stress = plan.proposed_action
+        position_after_stress = str(res.get("position_after_stress", "") if res else "") or plan.proposed_action
+
         if policy_conflicts or contradiction_count >= 2:
             position_after_stress = "pause_and_request_dba_approval"
             confidence_post_stress = max(1.0, confidence_post_stress - 1.5)

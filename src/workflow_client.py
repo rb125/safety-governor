@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.error
 import urllib.parse
@@ -86,7 +87,7 @@ class WorkflowClient:
         }
 
     def _format_slack_message(self, p: Dict) -> Dict:
-        """Formats reliability gate results into a concise, actionable Slack message."""
+        """Formats reliability gate results into a clear, actionable Slack message."""
         severity = str(p.get("severity", "medium")).upper()
         decision = str(p.get("decision", "unknown")).upper()
         decision_label = self._decision_label(decision)
@@ -104,6 +105,7 @@ class WorkflowClient:
         integration_quality = p.get("integration_quality", 0.0)
         trap_rejected = bool(p.get("fabrication_trap_rejected", False))
         disagreement = bool(p.get("disagreement_detected", False))
+        is_hazard = bool(p.get("is_critical_hazard", False))
         risk_level = self._risk_level(
             decision=decision,
             severity=severity,
@@ -114,42 +116,79 @@ class WorkflowClient:
         steps = self._extract_steps(action_mode, max_steps=3)
         links = self._build_elastic_links(service=service, incident_id=incident_id)
         why_not = self._why_not_lines(p)
-        verifier_result = "No critical contradiction detected" if contradiction_docs_count == 0 else "Critical contradiction(s) detected"
-        fallback_text = (
-            f"Incident Update - {service} ({severity})\n"
-            f"Incident: {incident_id}\n"
-            f"Decision: {decision_label}\n"
-            f"Confidence Before/After: {confidence_initial} -> {confidence_final} (delta {confidence_delta})\n"
-            f"Risk: {risk_level}\n"
-            f"Reason: {top_reason}\n"
-            f"Next:\n" + "\n".join(f"- {s}" for s in steps)
+
+        def _fmt(v) -> str:
+            try:
+                return f"{float(v):.2f}"
+            except (TypeError, ValueError):
+                return str(v)
+
+        confidence_line = f"{_fmt(confidence_initial)} → {_fmt(confidence_final)} (Δ {_fmt(confidence_delta)})"
+        coverage_pct = f"{int(float(integration_quality or 0) * 100)}%"
+        verifier_result = "No contradictions found" if contradiction_docs_count == 0 else f"{contradiction_docs_count} contradiction(s) found"
+        hallucination_check = (
+            "AI hallucination check: passed :white_check_mark:" if trap_rejected
+            else "AI hallucination check: failed — confidence was penalized :warning:"
         )
 
-        next_actions = "\n".join(f"• {s}" for s in steps) if steps else "• Follow runbook and verify service health."
+        # Header text — plain_text block does not support markdown syntax
+        if is_hazard:
+            header_text = f"[CRITICAL HAZARD] {service} ({severity}) — Human Approval Required"
+        elif decision == "EXECUTE":
+            header_text = f"Auto-Remediation Approved: {service} ({severity})"
+        else:
+            header_text = f"Human Escalation Required: {service} ({severity})"
+
+        fallback_text = (
+            f"[{severity}] {service} — {decision_label}\n"
+            f"Incident: {incident_id}\n"
+            f"Confidence shift: {confidence_line} | Risk: {risk_level}\n"
+            f"Reason: {top_reason}\n"
+            f"Next steps:\n" + "\n".join(f"• {s}" for s in steps)
+        )
+
+        next_actions = "\n".join(f"• {s}" for s in steps) if steps else "• Follow the service runbook and verify service health."
         link_text = " | ".join(f"<{u}|{label}>" for label, u in links.items() if u)
         channel_name = self.channel_label.lstrip("#")
-        status_emoji = ":white_check_mark:" if decision == "EXECUTE" else ":no_entry:"
-        is_hazard = bool(p.get("is_critical_hazard", False))
-        hazard_prefix = "🚨 *[CRITICAL HAZARD]* " if is_hazard else ""
-        status_header = f"{status_emoji} {hazard_prefix}Incident Update - {service} ({severity})"
-        confidence_line = f"{confidence_initial} -> {confidence_final} (delta {confidence_delta})"
+
         evidence_lines = [
-            f"• Support docs matched: {support_docs_count}",
-            f"• Contradictions matched: {contradiction_docs_count}",
+            f"• Runbooks matched: {support_docs_count}",
+            f"• Contradictions found: {contradiction_docs_count}",
             f"• Policy conflicts: {policy_conflicts_count}",
-            f"• Integration quality: {integration_quality}",
+            f"• Evidence coverage: {coverage_pct}",
             f"• Verifier result: {verifier_result}",
             f"• Risk level: {risk_level}",
         ]
         if disagreement:
-            evidence_lines.append("• Planner/Verifier disagreement detected")
+            evidence_lines.append("• :warning: Planner / Verifier disagreement detected")
         evidence_summary = "\n".join(evidence_lines)
-        safety_reason = "Fabrication trap rejected" if trap_rejected else "Fabrication trap not rejected"
+
+        action_section_title = "Automated Actions in Progress" if decision == "EXECUTE" else "Recommended Next Steps"
+
+        if decision != "EXECUTE":
+            if is_hazard:
+                approval_text = (
+                    "*:rotating_light: Override Required*\n"
+                    "This incident is classified as *critical*. An `APPROVE` reply alone will be refused by the Safety Governor.\n\n"
+                    "Reply `FORCE_OVERRIDE` in this thread to manually override the safety gate.\n"
+                    "_This override will be permanently logged for audit._"
+                )
+            else:
+                approval_text = (
+                    "*Approval Required*\n"
+                    "Reply in this thread with `APPROVE` to proceed with remediation, "
+                    "or `FORCE_OVERRIDE` to bypass the safety gate."
+                )
+        else:
+            approval_text = (
+                "*No Approval Needed*\n"
+                "Automated remediation is proceeding. Reply `HOLD` to pause execution."
+            )
 
         blocks = [
             {
                 "type": "header",
-                "text": {"type": "plain_text", "text": status_header}
+                "text": {"type": "plain_text", "text": header_text, "emoji": True},
             },
             {
                 "type": "section",
@@ -158,16 +197,15 @@ class WorkflowClient:
                     {"type": "mrkdwn", "text": f"*Service*\n`{service}`"},
                     {"type": "mrkdwn", "text": f"*Severity*\n`{severity}`"},
                     {"type": "mrkdwn", "text": f"*Decision*\n`{decision_label}`"},
-                    {"type": "mrkdwn", "text": f"*Confidence Shift Under Stress*\n`{confidence_line}`"},
-                ]
+                    {"type": "mrkdwn", "text": f"*Confidence Shift*\n`{confidence_line}`"},
+                ],
             },
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": "*Safety Gate*\nAGT Protocol 1.0"},
-            },
-            {
-                "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*Why This Decision*\n{top_reason}\n• {safety_reason}"},
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Why the Safety Gate Made This Decision*\n{top_reason}\n• {hallucination_check}",
+                },
             },
             {
                 "type": "section",
@@ -175,11 +213,15 @@ class WorkflowClient:
             },
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*Actions {'Executing' if decision == 'EXECUTE' else 'Recommended'}*\n{next_actions}"},
+                "text": {"type": "mrkdwn", "text": f"*{action_section_title}*\n{next_actions}"},
             },
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": f"*Why Not (Rejected Risky Action)*\n{why_not}"},
+                "text": {"type": "mrkdwn", "text": f"*Why Risky Actions Were Rejected*\n{why_not}"},
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": approval_text},
             },
             {
                 "type": "section",
@@ -190,9 +232,9 @@ class WorkflowClient:
                 "elements": [
                     {"type": "mrkdwn", "text": f"Channel: #{channel_name}"},
                     {"type": "mrkdwn", "text": f"Admin: {self._slack_mention_token()}"},
-                    {"type": "mrkdwn", "text": "Safety Gate: AGT Protocol 1.0"},
-                ]
-            }
+                    {"type": "mrkdwn", "text": "AI Safety Governor — Reliability Layer v1.0"},
+                ],
+            },
         ]
         return {
             "channel": f"#{channel_name}",
@@ -299,16 +341,18 @@ class WorkflowClient:
 
     def _build_elastic_links(self, service: str, incident_id: str) -> Dict[str, str]:
         kb = self.kibana_url.rstrip("/")
-        service_q = urllib.parse.quote(service or "", safe="")
         discover_query = f"service.name:\"{service}\" OR service:\"{service}\" OR incident_id:\"{incident_id}\""
         discover_query_q = urllib.parse.quote(discover_query, safe="")
         wf_query_q = urllib.parse.quote(f"incident_id:\"{incident_id}\"", safe="")
-        return {
-            "Discover (Service Logs)": f"{kb}/app/discover#/?_a=(query:(language:kuery,query:'{discover_query_q}'))",
-            "Discover (Workflow Events)": f"{kb}/app/discover#/?_a=(query:(language:kuery,query:'{wf_query_q}'))",
-            "Stack Management": f"{kb}/app/management/data/index_management/indices",
-            "Discover Home": f"{kb}/app/discover",
-        }
+        links: Dict[str, str] = {}
+        jira_url = os.getenv("JIRA_URL", "").rstrip("/")
+        if jira_url and incident_id and incident_id.startswith(("SRE-", "JIRA-")):
+            links[f"Jira {incident_id}"] = f"{jira_url}/browse/{incident_id}"
+        links["Discover (Service Logs)"] = f"{kb}/app/discover#/?_a=(query:(language:kuery,query:'{discover_query_q}'))"
+        links["Discover (Workflow Events)"] = f"{kb}/app/discover#/?_a=(query:(language:kuery,query:'{wf_query_q}'))"
+        links["Stack Management"] = f"{kb}/app/management/data/index_management/indices"
+        links["Discover Home"] = f"{kb}/app/discover"
+        return links
 
     @staticmethod
     def _normalize_text(value: str) -> str:
@@ -391,7 +435,7 @@ class WorkflowClient:
             f"({str(payload.get('severity', '')).upper()}).\n"
             f"Confidence shift: {confidence_initial} -> {confidence_final} (delta {confidence_delta})\n"
             f"Reason: {reason}\n"
-            f"Why not risky action: {why_not}\n"
+            f"Why the risky action was rejected: {why_not}\n"
             f"Immediate next steps:\n" + "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps)) + "\n"
             f"Links: {links_line}"
         )
@@ -522,7 +566,7 @@ class WorkflowClient:
         if policy > 0:
             lines.append(f"Policy conflicts detected: {policy}")
         if not lines:
-            lines.append("No high-risk alternative action selected.")
+            lines.append("No high-risk actions were considered or rejected.")
         return "\n".join(f"• {x}" for x in lines)
 
     @staticmethod

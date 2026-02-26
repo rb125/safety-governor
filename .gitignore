@@ -1,3 +1,17 @@
 __pycache__/
-.venv
+.venv/
+*.py[cod]
 
+# Credentials — never commit
+.env
+
+# Live output data — gitkeep the directory
+output/*.jsonl
+
+# Internal maintenance utilities
+purge_jira.py
+purge_runbooks.py
+verify_elastic.py
+
+# Local editor / tool settings
+.claude/

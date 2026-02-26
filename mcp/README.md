@@ -1,47 +1,68 @@
-# MCP Tools for CDCT/DDFT/EECT
+# MCP Server — Reliability Framework
 
-This folder provides an MCP server so Agent Builder can call framework scores as tools instead of relying only on direct Python API calls.
+Exposes 8 tools over Streamable HTTP (MCP 2025-03-26) so Kibana Agent Builder can call them autonomously during plan and stress phases.
 
-## Server
+## Tools
 
-- File: `mcp/reliability_framework_mcp_server.py`
-- Transport: `stdio` JSON-RPC
-- Tools exposed:
-- `ddft_score(model)`
-- `cdct_score(model)`
-- `eect_score(model)`
-- `reliability_profile(model)` (merged)
+### SRE Operation Tools
+| Tool | Description |
+|---|---|
+| `search_runbooks(query, service, top_k)` | Hybrid search over `runbooks-demo` filtered by service |
+| `search_evidence(query, service, top_k)` | Search `evidence-demo` for supporting/contradicting docs |
+| `check_policy_conflicts(service, action, severity)` | Query `policies-demo` for blocked actions |
+| `query_live_logs()` | Live error count + avg bytes from `kibana_sample_data_logs` |
 
-## Local Run (for manual check)
+### Reliability Framework Tools
+| Tool | Description |
+|---|---|
+| `ddft_score(model)` | DDFT robustness metrics (HOC, CI) from port 8002 |
+| `cdct_score(model)` | CDCT context-discipline metric (u_curve_magnitude) from port 8001 |
+| `eect_score(model)` | EECT action-gating metrics (AS, ACT, ECS) from port 8003 |
+| `reliability_profile(model)` | Merged CDCT + DDFT + EECT profile |
 
-```bash
-cd agentic/reliability_layer_incident_mvp
-python3 mcp/reliability_framework_mcp_server.py
-```
+## Running
 
-## Configure in Agent Builder (MCP)
-
-Create an MCP tool server in Agent Builder that launches:
-
-```bash
-python3 /home/rahul/arXiv/agentic/reliability_layer_incident_mvp/mcp/reliability_framework_mcp_server.py
-```
-
-Environment for that MCP server process:
-
-- `CDCT_API_URL=http://localhost:8001`
-- `DDFT_API_URL=http://localhost:8002`
-- `EECT_API_URL=http://localhost:8003`
-
-Attach the tool server to your Agent Builder agent (`ELASTIC_AGENT_ID`).
-
-## Enable MCP profile mode in this project
-
-Set:
+### HTTP mode (for Kibana Agent Builder on Elastic Cloud)
 
 ```bash
-export RELIABILITY_PROFILE_SOURCE="agent_builder_mcp"
+export $(grep -v '^#' ../.env | grep -v '^$' | xargs)
+../.venv/bin/python3 reliability_framework_mcp_server.py --http --port 8010
 ```
 
-In this mode, the reliability layer asks Agent Builder to call MCP tools and return merged profile JSON.  
-If MCP tools are unavailable or return empty values, the code falls back to direct API fetch.
+Endpoint: `http://0.0.0.0:8010/mcp`
+
+Expose via ngrok so Elastic Cloud can reach it:
+
+```bash
+ngrok http 8010
+# MCP URL: https://xxxx.ngrok-free.app/mcp
+```
+
+### stdio mode (for local testing)
+
+```bash
+export $(grep -v '^#' ../.env | grep -v '^$' | xargs)
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | \
+  ../.venv/bin/python3 reliability_framework_mcp_server.py
+```
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `ELASTIC_URL` | required | Elasticsearch cluster URL |
+| `ELASTIC_API_KEY` | required | Elasticsearch API key |
+| `ES_RUNBOOKS_INDEX` | `runbooks-demo` | Runbooks index name |
+| `ES_EVIDENCE_INDEX` | `evidence-demo` | Evidence index name |
+| `ES_POLICIES_INDEX` | `policies-demo` | Policies index name |
+| `CDCT_API_URL` | `http://localhost:8001` | CDCT scoring API |
+| `DDFT_API_URL` | `http://localhost:8002` | DDFT scoring API |
+| `EECT_API_URL` | `http://localhost:8003` | EECT scoring API |
+
+## Adding to Kibana Agent Builder
+
+1. Start server in HTTP mode and expose via ngrok
+2. Kibana → AI Assistant → Agent Builder → your agent → **Tools** tab
+3. **New tool** → **MCP** → paste `https://xxxx.ngrok-free.app/mcp`
+4. Import all 8 tools
+5. Set `ELASTIC_AGENT_ID` in `.env` to match your agent's ID
